@@ -493,75 +493,135 @@ def read_and_merge_files(ti=None, **_):
 
 def produce_outputs(ds: str, ti=None, **_):
     """
-    Lee los intermedios por grupo y escribe un output final por cada grupo.
-    Además genera (opcional) un 'final_global_{ds}' concatenando todos.
-    Normaliza dtypes para que Parquet (pyarrow) no se rompa con mixes.
+    - Escribe outputs por grupo (CSV/Parquet) leyendo cada intermedio por separado.
+    - Construye un CSV global en streaming, con encabezado de la unión de columnas.
+    - Construye un Parquet global en streaming, forzando todas las columnas a 'string'
+      para evitar conflictos de esquema entre grupos (p.ej., fecha string vs datetime).
+    - No convierte 'time' para el grupo 'pares'.
     """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     inter_paths = json.loads(ti.xcom_pull(key="interim_paths", task_ids="read_and_merge_files"))
+    inter_paths = [Path(p) for p in inter_paths if p]  # sanity
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
     final_paths = []
-    per_group_frames = []
 
+    # -------- rutas globales
+    out_csv_g = Path(OUTPUT_DIR) / f"final_global_{ds}.csv"
+    out_parquet_g = Path(OUTPUT_DIR) / f"final_global_{ds}.parquet"
+    if out_csv_g.exists():
+        out_csv_g.unlink()
+    if out_parquet_g.exists():
+        out_parquet_g.unlink()
+
+    # =========================
+    # 1) GUARDAR POR GRUPO
+    # =========================
     for p in inter_paths:
-        p = Path(p)
         if not p.exists():
             continue
-
-        # El nombre del grupo viene del archivo intermedio: interim_{group}.parquet
         group = p.stem.replace("interim_", "", 1)
-
-        # Cargar intermedio de ese grupo
         gdf = pd.read_parquet(p)
 
-        # --- Normalización segura para Parquet ---
-        # En 'pares' queremos 'time' como datetime; en el resto, string
-        if "time" in gdf.columns:
-            if group == "pares":
-                gdf["time"] = pd.to_datetime(gdf["time"], errors="coerce")
-            else:
-                gdf["time"] = gdf["time"].astype("string")
+        # Limpieza mínima coherente con lo anterior
+        # (NO tocar 'time' de pares; resto a string solo si lo necesitás)
+        if "time" in gdf.columns and group != "pares":
+            gdf["time"] = gdf["time"].astype("string")
 
-        # Todas las columnas object -> string (evita mixes raros)
-        for c in gdf.select_dtypes(include=["object"]).columns:
-            gdf[c] = gdf[c].astype("string")
+        # Quitar metadatos si quedara algo colado
+        gdf = gdf.drop(columns=["__source_sheet", "__group"], errors="ignore")
 
-        # Homogeneizar el resto de tipos donde sea posible
-        gdf = gdf.convert_dtypes()
-
-        # --- escribir finales por grupo ---
+        # Guardar por grupo
         out_parquet = Path(OUTPUT_DIR) / f"final_{group}_{ds}.parquet"
-        out_csv = Path(OUTPUT_DIR) / f"final_{group}_{ds}.csv"
-
+        out_csv     = Path(OUTPUT_DIR) / f"final_{group}_{ds}.csv"
         gdf.to_parquet(out_parquet, index=False)
         gdf.to_csv(out_csv, index=False)
-
         logging.info(f"[{group}] Guardado: {out_parquet} | {out_csv}")
         final_paths.extend([str(out_parquet), str(out_csv)])
 
-        per_group_frames.append(gdf)
+    # =========================
+    # 2) CSV GLOBAL (dos pasadas, streaming)
+    #     - 1a pasada: unión de columnas
+    #     - 2a pasada: reindex y append
+    # =========================
+    # 1a pasada: unión de columnas usando sólo esquemas (sin cargar todo)
+    global_cols = []
+    seen = set()
+    for p in inter_paths:
+        try:
+            pf = pq.ParquetFile(str(p))
+            cols = [name for name in pf.schema.names]
+        except Exception:
+            # fallback: leer el df (raro que falle)
+            cols = list(pd.read_parquet(p).columns)
+        for c in cols:
+            if c not in seen:
+                seen.add(c)
+                global_cols.append(c)
 
-    # (Opcional) también un final global
-    if per_group_frames:
-        df_global = pd.concat(per_group_frames, ignore_index=True)
+    # 2a pasada: escribir
+    wrote_header = False
+    with open(out_csv_g, "w", newline="", encoding="utf-8") as f:
+        for p in inter_paths:
+            df = pd.read_parquet(p).drop(columns=["__source_sheet", "__group"], errors="ignore")
+            # asegurá todas las columnas del global (agrega faltantes)
+            for c in global_cols:
+                if c not in df.columns:
+                    df[c] = pd.NA
+            df = df.reindex(columns=global_cols)
 
-        # --- Normalización global ---
-        if "time" in df_global.columns:
-            # Globalmente dejamos 'time' como string (grupos heterogéneos)
-            df_global["time"] = df_global["time"].astype("string")
+            if not wrote_header:
+                df.to_csv(f, index=False, header=True, mode="w")
+                wrote_header = True
+            else:
+                df.to_csv(f, index=False, header=False, mode="a")
 
-        for c in df_global.select_dtypes(include=["object"]).columns:
-            df_global[c] = df_global[c].astype("string")
+    final_paths.append(str(out_csv_g))
+    logging.info(f"[global] CSV guardado: {out_csv_g}")
 
-        df_global = df_global.convert_dtypes()
+    # =========================
+    # 3) PARQUET GLOBAL (streaming, todo como string)
+    #     - Unifica esquema casteando columnas a string para evitar errores de tipo
+    # =========================
+    # Definir schema Arrow como 'string' para cada columna global
+    arrow_fields = [pa.field(col, pa.string()) for col in global_cols]
+    schema_arrow = pa.schema(arrow_fields)
 
-        out_parquet_g = Path(OUTPUT_DIR) / f"final_global_{ds}.parquet"
-        out_csv_g = Path(OUTPUT_DIR) / f"final_global_{ds}.csv"
-        df_global.to_parquet(out_parquet_g, index=False)
-        df_global.to_csv(out_csv_g, index=False)
-        logging.info(f"[global] Guardado: {out_parquet_g} | {out_csv_g}")
-        final_paths.extend([str(out_parquet_g), str(out_csv_g)])
+    writer = pq.ParquetWriter(out_parquet_g, schema_arrow)
+    try:
+        for p in inter_paths:
+            df = pd.read_parquet(p).drop(columns=["__source_sheet", "__group"], errors="ignore")
 
+            # agrega faltantes y ordena
+            for c in global_cols:
+                if c not in df.columns:
+                    df[c] = pd.NA
+            df = df.reindex(columns=global_cols)
+
+            # casteo a string SOLO para el global parquet
+            df_string = df.copy()
+            for c in df_string.columns:
+                # objetos/fechas/etc. -> string
+                if not pd.api.types.is_string_dtype(df_string[c]):
+                    # fechas/horas a string legible; resto a string directa
+                    if pd.api.types.is_datetime64_any_dtype(df_string[c]):
+                        df_string[c] = df_string[c].dt.strftime("%Y-%m-%d %H:%M:%S").astype("string")
+                    else:
+                        df_string[c] = df_string[c].astype("string")
+
+            table = pa.Table.from_pandas(df_string, preserve_index=False, schema=schema_arrow)
+            writer.write_table(table)
+    finally:
+        writer.close()
+
+    final_paths.append(str(out_parquet_g))
+    logging.info(f"[global] Parquet guardado: {out_parquet_g}")
+
+    # =========================
+    # 4) XCom con rutas finales
+    # =========================
     if ti:
         ti.xcom_push(key="final_paths", value=json.dumps(final_paths))
 
