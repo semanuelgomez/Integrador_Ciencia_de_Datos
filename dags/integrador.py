@@ -15,6 +15,24 @@ from airflow import DAG
 import pendulum
 from airflow.operators.python import PythonOperator
 
+import re
+
+_DT_NUM_RE = re.compile(
+    r"""^\s*
+        (?P<time>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})      # fecha y hora
+        [\s,;|]+
+        (?P<open>[-+]?\d+(?:\.\d+)?)
+        [\s,;|]+
+        (?P<high>[-+]?\d+(?:\.\d+)?)
+        [\s,;|]+
+        (?P<low>[-+]?\d+(?:\.\d+)?)
+        [\s,;|]+
+        (?P<close>[-+]?\d+(?:\.\d+)?)
+        (?:[\s,;|]+(?P<volume>[-+]?\d+(?:\.\d+)?))?
+        """,
+    re.X,
+)
+
 AIRFLOW_HOME = os.environ.get("AIRFLOW_HOME", "/usr/local/airflow")
 RAW_DIR      = os.path.join(AIRFLOW_HOME, "include", "data", "raw")
 INTERIM_DIR  = os.path.join(AIRFLOW_HOME, "include", "data", "interim")
@@ -80,14 +98,18 @@ SCHEMA_RULES = {
 
     # pares => OHLCV (Time, Open, High, Low, Close, Volume)
     # Muchos vienen en 1 sola columna separada por espacios/tabs/coma.
-    "pares": {
-        "csv": {"sep": r"\s+|\t|,", "engine": "python", "encoding": "utf-8"},
-        "rename": {"Time":"time", "Open":"open", "High":"high", "Low":"low",
-                   "Close":"close", "Volume":"volume"},
-        "dates": ["time"],
-        "numbers": ["open","high","low","close","volume"],
-        "required": ["time"],
-        "drop_duplicates": True,
+       "pares": {
+        "csv": {
+            # Dejá que pandas infiera el separador (requiere engine=python)
+            "sep": None,
+            "engine": "python",
+            "header": None,
+            # hasta 7 columnas por si aparece una extra (count)
+            "names": ["time", "open", "high", "low", "close", "volume", "_extra"],
+            "usecols": ["time", "open", "high", "low", "close", "volume"],
+            "dtype": {"time": "string"},
+            "na_values": ["", "null", "NaN"]
+        }
     },
 
     # fallback si aparece otra carpeta
@@ -149,96 +171,208 @@ def apply_rules(df: pd.DataFrame, rules: dict) -> pd.DataFrame:
 # =========================
 # TRANSFORMACIONES ESPECÍFICAS POR GRUPO
 # =========================
+# ---------- TRANSFORMACIONES POR GRUPO (COPIAR/PEGAR COMPLETO) ----------
+
+def _drop_meta_cols(df: pd.DataFrame) -> pd.DataFrame:
+    # Eliminá columnas internas que no querés en los outputs
+    return df.drop(columns=["__source_sheet", "__group"], errors="ignore")
+
 def transform_calendario(df: pd.DataFrame) -> pd.DataFrame:
     """
-    news.csv: nos quedamos SOLO con 5 campos (fecha, hora, pais, impacto, nombre).
-    Si vienen menos columnas, rellenamos; si vienen más, recortamos.
-    Soporta casos con 1 columna 'gigante' y también cuando ya vino separado.
+    Esperado: 5 columnas -> fecha, hora, pais, impacto, nombre.
+    El origen a veces entra como UNA sola columna con comas/; y comillas.
     """
-    if df.shape[1] == 1:
-        # Una sola col -> partir por coma en máximo 4 splits (=> hasta 5 columnas)
-        col0 = df.columns[0]
-        split = df[col0].astype(str).str.split(",", n=4, expand=True)
-    else:
-        # Ya vino separado: nos quedamos con las primeras 5 (pueden ser <5)
-        split = df.iloc[:, :5].copy()
+    df = _drop_meta_cols(df)
+    # trabajamos sobre la primera columna en forma robusta
+    s = df.iloc[:, 0].astype("string").str.replace(";", ",", regex=False).str.strip()
 
-    # Asegurar EXACTAMENTE 5 columnas (pad con NaN si faltan)
-    split = split.reindex(columns=range(5))
+    # tomamos solo los primeros 5 campos, ignorando lo que venga después
+    parts = s.str.split(",", n=4, expand=True)
+    # asegurar 5 columnas aunque falten campos
+    while parts.shape[1] < 5:
+        parts[parts.shape[1]] = pd.NA
+    parts = parts.iloc[:, :5]
+    parts.columns = ["fecha", "hora", "pais", "impacto", "nombre"]
 
-    # Renombrar a los 5 nombres requeridos
-    split.columns = ["fecha", "hora", "pais", "impacto", "nombre"]
-
-    # Limpieza rápida de espacios y comillas
-    for c in ["hora", "pais", "impacto", "nombre"]:
-        split[c] = split[c].astype(str).str.strip().str.strip('"').str.strip()
-
-    # Normalizar fecha (formato tipo 2007/01/01 -> datetime)
-    split["fecha"] = (
-        split["fecha"]
-        .astype(str)
-        .str.strip()
-        .str.replace("/", "-", regex=False)
-    )
-    split["fecha"] = pd.to_datetime(split["fecha"], errors="coerce")
-
-    return split
-
-
+    # tipitos suaves
+    # (si querés fecha/hora como datetime, podés parsear acá)
+    return parts
 
 def transform_desastres(df: pd.DataFrame) -> pd.DataFrame:
-    df = _snake_cols(df)
-    # Crear start_date / end_date a partir de partes si existen
-    for prefix in ["start", "end"]:
-        y, m, d = f"{prefix}_year", f"{prefix}_month", f"{prefix}_day"
-        if all(c in df.columns for c in [y,m,d]):
-            df[f"{prefix}_date"] = pd.to_datetime(
-                df[[y,m,d]].rename(columns={y:"year", m:"month", d:"day"}),
-                errors="coerce"
-            )
-    # numéricos típicos
-    for c in [
-        "total_deaths","no_injured","no_affected","no_homeless","total_affected",
-        "reconstruction_costs_000_us","reconstruction_costs_adjusted_000_us",
-        "insured_damage_000_us","insured_damage_adjusted_000_us",
-        "total_damage_000_us","total_damage_adjusted_000_us",
-        "cpi","magnitude","latitude","longitude","aid_contribution_000_us"
-    ]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+    """
+    Debe conservar 'tal cual' todas las columnas del original.
+    A veces entra en una sola columna; intentamos dividir por separador probable.
+    """
+    df = _drop_meta_cols(df)
+    if df.shape[1] == 1:
+        raw = df.iloc[:, 0].astype("string")
+        # intentá primero tab, luego ';', luego ','
+        for sep in ["\t", ";", ","]:
+            parts = raw.str.split(sep, expand=True)
+            # si ‘parece’ que la primera fila es header (mucho texto), la usamos
+            header = parts.iloc[0].tolist()
+            if any(isinstance(x, str) and len(x) > 0 for x in header):
+                parts.columns = [str(c).strip() for c in header]
+                parts = parts.iloc[1:].reset_index(drop=True)
+                return parts
+        # si no detectamos, devolvemos la columna única (pero ya al menos no rompemos)
+        parts = raw.to_frame(name="raw")
+        return parts
+    else:
+        # ya viene con columnas – devolvelo como está
+        return df.reset_index(drop=True)
 
 def transform_noticias(df: pd.DataFrame) -> pd.DataFrame:
-    df = _snake_cols(df)
-    for c in ["actual","forecast","previous"]:
-        if c in df.columns:
-            df[c] = (
-                df[c].astype(str).str.replace("%","", regex=False).str.replace(",","", regex=False)
-            )
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "release_date" in df.columns:
-        df["release_date"] = pd.to_datetime(df["release_date"], errors="coerce")
-    return df
+    """
+    Salida: 6 columnas -> fecha, hora, actual, forecast, previo, source_file.
+    Nada de __source_sheet/__group.
+    """
+    df = _drop_meta_cols(df)
+
+    # Si viene como una sola columna, separamos en 5 (fecha, hora, actual, forecast, previo)
+    if df.shape[1] == 1:
+        s = df.iloc[:, 0].astype("string").str.replace(";", ",", regex=False).str.strip()
+        parts = s.str.split(",", n=4, expand=True)
+        while parts.shape[1] < 5:
+            parts[parts.shape[1]] = pd.NA
+        parts = parts.iloc[:, :5]
+        parts.columns = ["fecha", "hora", "actual", "forecast", "previo"]
+        out = parts
+    else:
+        # normalizamos nombres para encontrar columnas conocidas
+        cols_norm = {c: str(c).strip().lower().replace(" ", "_") for c in df.columns}
+        df = df.rename(columns=cols_norm)
+
+        # mapeos típicos de los archivos de "news"
+        # (Release Date, Time, Actual, Forecast, Previous)
+        fecha_col   = next((c for c in df.columns if c in ["release_date", "fecha"]), None)
+        hora_col    = next((c for c in df.columns if c in ["time", "hora"]), None)
+        actual_col  = next((c for c in df.columns if c in ["actual"]), None)
+        forecast_col= next((c for c in df.columns if c in ["forecast"]), None)
+        previo_col  = next((c for c in df.columns if c in ["previous", "previo"]), None)
+
+        out = pd.DataFrame({
+            "fecha":   df[fecha_col]   if fecha_col   else pd.NA,
+            "hora":    df[hora_col]    if hora_col    else pd.NA,
+            "actual":  df[actual_col]  if actual_col  else pd.NA,
+            "forecast":df[forecast_col]if forecast_col else pd.NA,
+            "previo":  df[previo_col]  if previo_col  else pd.NA,
+        })
+
+    # agregamos SOLO source_file (lo pediste)
+    out["source_file"] = df["__source_file"] if "__source_file" in df.columns else pd.NA
+    return out
+
+def _parse_pairs_series(s: pd.Series) -> pd.DataFrame:
+    """
+    Intenta parsear cada línea de 'pares' tolerando separadores variados.
+    - Primero intenta split por coma / ';' / tab / espacios múltiples.
+    - Si no, usa regex que busca time + 5 números (y volume opcional).
+    Devuelve DataFrame con columnas: time, open, high, low, close, volume
+    y una máscara booleana de 'ok' para saber si se parseó.
+    """
+    records = []
+    ok_flags = []
+
+    for raw in s.fillna("").astype("string"):
+        line = raw.strip()
+        row = None
+
+        # 1) splits más comunes
+        for sep in [",", ";", "\t", r"\s+"]:
+            if sep == r"\s+":
+                parts = re.split(r"\s+", line) if line else []
+            else:
+                if sep in line:
+                    parts = [p.strip() for p in line.split(sep)]
+                else:
+                    parts = []
+            if len(parts) >= 6:
+                # caso típico: time, open, high, low, close, volume
+                row = {
+                    "time": parts[0],
+                    "open": parts[1],
+                    "high": parts[2],
+                    "low":  parts[3],
+                    "close":parts[4],
+                    "volume": parts[5],
+                }
+                break
+            # caso “whitespace”: a veces es fecha, hora, open, high, low, close, volume
+            if len(parts) >= 7 and sep == r"\s+":
+                row = {
+                    "time":  f"{parts[0]} {parts[1]}",
+                    "open":  parts[2],
+                    "high":  parts[3],
+                    "low":   parts[4],
+                    "close": parts[5],
+                    "volume":parts[6],
+                }
+                break
+
+        # 2) regex fallback si los splits no funcionaron
+        if row is None:
+            m = _DT_NUM_RE.match(line)
+            if m:
+                row = m.groupdict()
+                # si no vino volume, déjalo vacío
+                row.setdefault("volume", None)
+
+        if row is None:
+            # falló: devolvemos vacíos para esta fila
+            records.append({"time": None, "open": None, "high": None, "low": None, "close": None, "volume": None, "_raw": raw})
+            ok_flags.append(False)
+        else:
+            records.append({**row, "_raw": raw})
+            ok_flags.append(True)
+
+    out = pd.DataFrame.from_records(records)
+    return out[["time","open","high","low","close","volume","_raw"]], pd.Series(ok_flags, name="_ok")
 
 def transform_pares(df: pd.DataFrame) -> pd.DataFrame:
-    # si llegó en una sola columna, separar (espacios / tabs / coma)
+    """
+    Normaliza 'pares' a: time, open, high, low, close, volume, source_file
+    Soporta múltiples formatos de origen.
+    Loguea filas que no se pudieron parsear (para inspección).
+    """
+    # si vino en una sola columna, la tomamos como texto crudo
     if df.shape[1] == 1:
-        col0 = df.columns[0]
-        split = df[col0].astype(str).str.split(r"\s+|\t|,", expand=True)
-        cols = ["time","open","high","low","close","volume"]
-        split = split.iloc[:, :len(cols)]
-        split.columns = cols[:split.shape[1]]
-        df = split
-    df = df.rename(columns={
-        "Time":"time","Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"
-    })
-    df = _snake_cols(df)
-    if "time" in df.columns:
-        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+        raw = df.iloc[:, 0].astype("string")
+        parsed, ok = _parse_pairs_series(raw)
+    else:
+        # ya vienen columnas: normalizamos nombres y nos quedamos con las que necesitamos
+        rename = {c: str(c).strip().lower() for c in df.columns}
+        tmp = df.rename(columns=rename)
+        # si tiene fecha + hora en columnas separadas, únelas
+        if {"fecha","hora"}.issubset(tmp.columns) and "time" not in tmp.columns:
+            tmp["time"] = (tmp["fecha"].astype("string") + " " + tmp["hora"].astype("string")).str.strip()
+        need = ["time","open","high","low","close","volume"]
+        parsed = tmp.reindex(columns=need)
+        parsed["_raw"] = parsed.astype(str).agg(",".join, axis=1)
+        ok = pd.Series(True, index=parsed.index, name="_ok")
+
+    # tipado numérico
     for c in ["open","high","low","close","volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+        parsed[c] = pd.to_numeric(parsed[c], errors="coerce")
+
+    # setear source_file
+    src = df["__source_file"].iloc[0] if "__source_file" in df.columns and len(df) else pd.NA
+    parsed["source_file"] = src
+
+    # Guardar filas problemáticas a un CSV (una sola vez por llamada; si no estás dentro de Airflow, ajustá la ruta)
+    bad = parsed[~ok].copy()
+    if len(bad):
+        # no “rompas” la corrida: solo deja registro
+        out_bad = Path(OUTPUT_DIR) / f"pares_badrows_{pd.Timestamp.now().date()}.csv"
+        out_bad.parent.mkdir(parents=True, exist_ok=True)
+        # columnas útiles
+        bad[["source_file","_raw"]].to_csv(out_bad, index=False)
+        logging.warning(f"[pares] {len(bad)} filas no parseadas. Ver: {out_bad}")
+
+    # salida final ordenada
+    return parsed[["time","open","high","low","close","volume","source_file"]]
+
+
 
 GROUP_TRANSFORMS = {
     "calendario": transform_calendario,
@@ -347,6 +481,8 @@ def read_and_merge_files(ti=None, **_):
 
         # 3) Opcional: convertir dtypes donde aplique (no convierte 'string' a int)
         gdf = gdf.convert_dtypes()
+
+        gdf = gdf.drop(columns=["__source_sheet", "__group"], errors="ignore")
 
         gdf.to_parquet(gpath, index=False)
         inter_paths.append(str(gpath))

@@ -1,4 +1,4 @@
 pandas
 openpyxl
 pyarrow
-numpy
+numpy
