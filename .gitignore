@@ -1,0 +1,31 @@
+.git
+.env
+.DS_Store
+airflow_settings.yaml
+__pycache__/
+astro
+.venv
+airflow-webserver.pid
+webserver_config.py
+airflow.cfg
+airflow.db
+@'
+# Artefactos generados
+include/output/
+include/data/interim/
+output/
+**/*.parquet
+**/*.zip
+
+# Python / caches
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets/local
+.env
+
+# SO
+.DS_Store
+Thumbs.db
+'@ | Out-File -Encoding UTF8 .gitignore
